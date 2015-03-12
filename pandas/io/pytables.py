@@ -14,7 +14,7 @@ import os
 
 import numpy as np
 from pandas import (Series, TimeSeries, DataFrame, Panel, Panel4D, Index,
-                    MultiIndex, Int64Index, Timestamp)
+                    MultiIndex, Int64Index, Timestamp, isnull)
 from pandas.sparse.api import SparseSeries, SparseDataFrame, SparsePanel
 from pandas.sparse.array import BlockIndex, IntIndex
 from pandas.tseries.api import PeriodIndex, DatetimeIndex
@@ -147,6 +147,8 @@ _FORMAT_MAP = {
     u('fixed'): 'fixed',
     u('t'): 'table',
     u('table'): 'table',
+    u('c'): 'column',
+    u('column'): 'column',
 }
 
 format_deprecate_doc = """
@@ -393,6 +395,15 @@ class HDFStore(StringMixin):
         self._complib = complib
         self._fletcher32 = fletcher32
         self._filters = None
+
+        # for columnar tables -- consider one dict to consolidate
+        self._column_tables = set([])
+        self._index_names = {}
+        self._chunk_size_names = {}
+        self._store_indexes = {}
+        self._tables = {}
+        self._collimits = {}
+
         self.open(mode=mode, **kwargs)
 
     @property
@@ -613,10 +624,42 @@ class HDFStore(StringMixin):
         -------
         obj : type of object stored in file
         """
+        if key in self._column_tables:
+            return concat([self.get(i) for i in self._tables[key]], axis=1)
         group = self.get_node(key)
         if group is None:
             raise KeyError('No object named %s in the file' % key)
         return self._read_group(group)
+
+    def _get_chunk_name(self, name, chunk):
+        """
+        Returns a standardized sub-table chunk
+        """
+        return '_{0}_{1}'.format(name, chunk)
+
+    def _initialize_column_table(self, name, collimit=100):
+        if name in self._column_tables:
+            return
+        # a column store convention (a wide table)
+        index_name = '{0}_store_index'.format(name)
+        self._index_names[name] = index_name
+        chunk_name = '{0}_chunk_size'.format(name)
+        self._chunk_size_names[name] = chunk_name
+        self._chunk_col_name = 'chunk'
+        self._index_itemsize = 255
+        try:
+            self._store_indexes[name] = self.select(index_name)
+        except KeyError:
+            self._store_indexes[name] = DataFrame(columns=[self._chunk_col_name])
+            self.put(index_name, self._store_indexes[name])
+        finally:
+            self._tables[name] = [i[0] for i in self.iteritems() if i[0].startswith('_{0}'.format(name))]
+        try:
+            self._collimits[name] = self.select(chunk_name)
+        except KeyError:
+            self.append(chunk_name, Series(collimit))
+            self._collimits[name] = collimit
+        self._column_tables.add(name)
 
     def select(self, key, where=None, start=None, stop=None, columns=None,
                iterator=False, chunksize=None, auto_close=False, **kwargs):
@@ -642,6 +685,14 @@ class HDFStore(StringMixin):
         The selected object
 
         """
+        if key in self._column_tables:
+            if columns is not None:
+                selected_tables = [self._tables[key][int(i)] for i in self._store_indexes[key].loc[columns, 'chunk'].drop_duplicates()]
+            else:
+                selected_tables = self._tables[key]
+            return concat([self.select(i, where=where, start=start, stop=stop, columns=columns,
+                                       iterator=iterator, chunksize=chunksize, auto_close=auto_close,
+                                       **kwargs) for i in selected_tables], axis=1)
         group = self.get_node(key)
         if group is None:
             raise KeyError('No object named %s in the file' % key)
@@ -698,6 +749,8 @@ class HDFStore(StringMixin):
             is part of a data block)
 
         """
+        if key in self._column_tables:
+            key = [self._tables[key][int(i)] for i in self._store_indexes[key].loc[column, 'chunk'].drop_duplicates()][0]
         return self.get_storer(key).read_column(column=column, **kwargs)
 
     def select_as_multiple(self, keys, where=None, selector=None, columns=None,
@@ -860,7 +913,7 @@ class HDFStore(StringMixin):
             return s.delete(where=where, start=start, stop=stop)
 
     def append(self, key, value, format=None, append=True, columns=None,
-               dropna=None, **kwargs):
+               dropna=None, destroy=True, collimit=100, **kwargs):
         """
         Append to Table in file. Node must already exist and be Table
         format.
@@ -874,6 +927,10 @@ class HDFStore(StringMixin):
                        Write as a PyTables Table structure which may perform
                        worse but allow more flexible operations like searching
                        / selecting subsets of the data
+            column(c): column format
+                       Write a PyTables Table structure that is subdivided into
+                       tables of a given column size (collimit). This will impact
+                       performance but allow for tables of nearly unlimited size.
         append       : boolean, default True, append the input data to the
             existing
         data_columns : list of columns to create as data columns, or True to
@@ -885,6 +942,10 @@ class HDFStore(StringMixin):
         encoding     : default None, provide an encoding for strings
         dropna       : boolean, default True, do not write an ALL nan row to
             the store settable by the option 'io.hdf.dropna_table'
+        destroy      : boolean, default True, for wide tables the input may
+            be modified in place and ultimately, deleted.
+        collimit     : int, default 100, the default number of columns to store
+           for a wide table.
         Notes
         -----
         Does *not* check if data being appended overlaps with existing
@@ -898,6 +959,69 @@ class HDFStore(StringMixin):
             dropna = get_option("io.hdf.dropna_table")
         if format is None:
             format = get_option("io.hdf.default_format") or 'table'
+        if format in ('c', 'column') and isinstance(value, DataFrame):
+            self._initialize_column_table(key, collimit=collimit)
+            chunks = self._store_indexes[key]
+            chunk_size = self._collimits[key]
+            columns_added = []
+            if not chunks.empty:
+                existing_map = chunks[value.columns]
+                existing = existing_map.dropna().to_dict()
+                # existing is a dict of {'column': 'chunk'}, we want {'chunk': columns set}
+                existing_rev = {}
+                for key, value in existing.iteritems():
+                    try:
+                        existing_rev[value].append(key)
+                    except KeyError:
+                        existing_rev[value] = [key]
+
+                # update existing entries
+                for chunk_index, chunk_columns in existing_rev.iteritems():
+                    chunk_name = self._get_chunk_name(key, chunk_index)
+                    cd = self.select(chunk_name)
+                    cd = cd.merge(value.loc[:, chunk_columns], how='outer')
+                    self.append(chunk_name, cd)
+                    del cd
+                    columns_added.extend(chunk_columns)
+
+            # we cannot use set logic here because we lose the ordering
+            new_cols = value.columns.drop(columns_added)
+            if new_cols.any():
+                if destroy:
+                    value = value[new_cols]
+                else:
+                    value = value.copy()[new_cols]
+                if chunks.empty:
+                    current_chunk = 0
+                else:
+                    current_chunk = chunks.astype('int').max()
+                    if isnull(current_chunk):
+                        current_chunk = 0
+                space_taken = len(chunks.where(chunks == str(current_chunk)).dropna())
+                end = self._collimits[key]-space_taken
+                if end == 0:
+                    # we have no more room in the last chunk
+                    current_chunk += 1
+                    if len(new_cols) > self.chunk_size:
+                        end = self.chunk_size
+                    else:
+                        end = len(new_cols)
+                elif end > len(new_cols):
+                    end = len(new_cols)
+                start = 0
+                while start < len(new_cols):
+                    chunk_name = self._get_chunk_name(key, current_chunk)
+                    self.append(chunk_name, value.iloc[:, start:end])
+                    for col_name in value.columns[start:end]:
+                        self._store_indexes[key].loc[col_name,'chunk'] = str(current_chunk)
+                    self._tables[key].append(chunk_name)
+                    start = end
+                    end += chunk_size
+                    if end > len(new_cols):
+                        end = len(new_cols)
+                    current_chunk += 1
+                self.put(self._index_names[key], self._store_indexes[key])
+            return
         kwargs = self._validate_format(format, kwargs)
         self._write_to_group(key, value, append=append, dropna=dropna,
                              **kwargs)

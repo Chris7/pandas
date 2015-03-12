@@ -755,6 +755,17 @@ class TestHDFStore(tm.TestCase):
             store.append('/df3', df[10:])
             tm.assert_frame_equal(store['df3'], df)
 
+            _maybe_remove(store, 'cf1')
+            store.append('cf1', df[:10], format='c', collimit=3)
+            # test we can recombine the columns to the original data
+            tm.assert_frame_equal(store['cf1'], df[:10])
+            # test we can query across tables
+            cols = ['A', 'D']
+            tm.assert_frame_equal(store['cf1'][cols], df[:10][cols])
+            # test queries
+            tm.assert_frame_equal(store.select('cf1', where='columns=="A"'), DataFrame(df[:10]['A']))
+            tm.assert_frame_equal(store.select('cf1', columns=["A"]), DataFrame(df[:10]['A']))
+
             # this is allowed by almost always don't want to do it
             with tm.assert_produces_warning(expected_warning=tables.NaturalNameWarning):
                 _maybe_remove(store, '/df3 foo')
@@ -823,6 +834,7 @@ class TestHDFStore(tm.TestCase):
             _maybe_remove(store, 'uints')
             store.append('uints', uint_data, data_columns=['u08','u16','u32']) # 64-bit indices not yet supported
             tm.assert_frame_equal(store['uints'], uint_data)
+
 
     def test_append_series(self):
 
